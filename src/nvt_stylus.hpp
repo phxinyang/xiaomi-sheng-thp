@@ -96,9 +96,20 @@ struct StylusFrameResult {
     StylusCoordinates coordinates;
 };
 
+// Stock n81a_nova_thp_config.ini carries two stylus calibration tables:
+// profile 1 (default / M80p) and profile 2 (stylus_2 / P81c Focus Pen Pro).
+enum class StylusCalibrationProfile {
+    Standard = 1,
+    Pro = 2,
+};
+
 class StylusDecoder {
 public:
     void reset();
+    void setCalibrationProfile(StylusCalibrationProfile profile);
+    StylusCalibrationProfile calibrationProfile() const {
+        return calibration_profile_;
+    }
     StylusFrameResult process(const RawStylusFrame &raw);
 
 private:
@@ -151,6 +162,8 @@ private:
     TipGateState tip_gate_;
     StylusCoordinateState coordinate_state_;
     AxisHistory axis_history_;
+    StylusCalibrationProfile calibration_profile_ =
+        StylusCalibrationProfile::Standard;
     int status_ = 0;
     int previous_status_ = 0;
     int stylus_level_ = 0;
@@ -183,8 +196,8 @@ void refineTipAxes(TipAxes &axes);
 bool acceptTipEdges(const TipAxes &axes);
 void separateRingAxes(const RawStylusFrame &raw, RingAxes &output);
 void removeRingBackground(RingAxes &axes, int threshold = 200);
-StylusCoordinates calculateStylusCoordinates(const TipAxes &tip,
-                                             const RingAxes &ring,
-                                             StylusCoordinateState &state);
+StylusCoordinates calculateStylusCoordinates(
+    const TipAxes &tip, const RingAxes &ring, StylusCoordinateState &state,
+    StylusCalibrationProfile profile = StylusCalibrationProfile::Standard);
 
 }  // namespace nvt

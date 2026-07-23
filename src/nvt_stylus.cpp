@@ -29,12 +29,18 @@ constexpr std::size_t kRequiredSize =
 constexpr std::size_t kTip1CandidateColumns = 12;
 constexpr std::size_t kTip2CandidateRows = 8;
 constexpr int kSuperResolution = 10;
+// Stock default stylus table (ordinary Focus Pen / M80p).
 constexpr int kCalibrationThreshold = 40 * kSuperResolution;
 constexpr int kCalibrationRate = 10;
+// Stock stylus_2 table (Focus Pen Pro / P81c).
+constexpr int kProCalibrationThreshold = 24 * kSuperResolution;
+constexpr int kProCalibrationRate = 7;
 constexpr int kTipPitch40 = 50 * kSuperResolution;
 constexpr int kTipPitch60 = 50 * kSuperResolution;
 constexpr int kTipSlope40 = 5;
 constexpr int kTipSlope60 = 5;
+constexpr int kProTipSlope40 = 6;
+constexpr int kProTipSlope60 = 6;
 constexpr int kTipEdgeParameter = 8;
 constexpr std::array<int, kStylusAxis40Nodes> kAxis40Mapping = {
     26, 78, 130, 182, 234, 286, 338, 390, 442, 494,
@@ -51,7 +57,26 @@ constexpr std::array<int, kStylusAxis60Nodes> kAxis60Mapping = {
     2572, 2623, 2673, 2723, 2773, 2823, 2873, 2923, 2973, 3023,
 };
 constexpr std::array<int, 6> kTiltDifferences = {0, 50, 65, 87, 101, 108};
+// stylus_2_coor_diff from n81a_nova_thp_config.ini
+constexpr std::array<int, 6> kProTiltDifferences = {0, 29, 37, 49, 60, 64};
 constexpr std::array<int, 6> kTiltAngles = {0, 1500, 3000, 4500, 6000, 7000};
+
+struct StylusCalibration {
+    int tip_slope_40 = kTipSlope40;
+    int tip_slope_60 = kTipSlope60;
+    int calibration_threshold = kCalibrationThreshold;
+    int calibration_rate = kCalibrationRate;
+    std::array<int, 6> tilt_differences = kTiltDifferences;
+};
+
+StylusCalibration calibrationFor(StylusCalibrationProfile profile) {
+    if (profile == StylusCalibrationProfile::Pro) {
+        return StylusCalibration{
+            kProTipSlope40, kProTipSlope60, kProCalibrationThreshold,
+            kProCalibrationRate, kProTiltDifferences};
+    }
+    return StylusCalibration{};
+}
 
 int wrapAdd(int first, int second) {
     const std::uint32_t value = std::bit_cast<std::uint32_t>(first) +
@@ -528,28 +553,28 @@ int tipCoordinate(const std::array<int, AxisSize> &axis,
     return mapping.back() * kSuperResolution - pitch / 2 + correction;
 }
 
-int calibrateTipCoordinate(int coordinate, int difference) {
-    if (std::abs(difference) <= kCalibrationThreshold)
+int calibrateTipCoordinate(int coordinate, int difference,
+                           int threshold, int rate) {
+    if (std::abs(difference) <= threshold)
         return coordinate;
-    const int signed_threshold = difference < 0
-                                     ? kCalibrationThreshold
-                                     : -kCalibrationThreshold;
-    return coordinate - (difference + signed_threshold) / kCalibrationRate;
+    const int signed_threshold = difference < 0 ? threshold : -threshold;
+    return coordinate - (difference + signed_threshold) / rate;
 }
 
-int differenceToTilt(int difference) {
+int differenceToTilt(int difference,
+                     const std::array<int, 6> &tilt_differences) {
     const int sign = difference < 0 ? -1 : 1;
     int magnitude = std::abs(difference);
-    const int maximum = kTiltDifferences.back() * kSuperResolution;
+    const int maximum = tilt_differences.back() * kSuperResolution;
     if (magnitude >= maximum)
-        magnitude = (kTiltDifferences.back() - 1) * kSuperResolution;
+        magnitude = (tilt_differences.back() - 1) * kSuperResolution;
 
     std::size_t interval = 0;
-    while (interval + 2 < kTiltDifferences.size() &&
-           magnitude >= kTiltDifferences[interval + 1] * kSuperResolution)
+    while (interval + 2 < tilt_differences.size() &&
+           magnitude >= tilt_differences[interval + 1] * kSuperResolution)
         ++interval;
     const int difference_span =
-        kTiltDifferences[interval + 1] - kTiltDifferences[interval];
+        tilt_differences[interval + 1] - tilt_differences[interval];
     const int angle_per_unit = difference_span == 0
                                    ? 0
                                    : (kTiltAngles[interval + 1] -
@@ -557,7 +582,7 @@ int differenceToTilt(int difference) {
                                          difference_span;
     const int angle = kTiltAngles[interval] +
                       ((magnitude -
-                        kTiltDifferences[interval] * kSuperResolution) *
+                        tilt_differences[interval] * kSuperResolution) *
                        angle_per_unit) /
                           kSuperResolution;
     return sign * (angle / 100);
@@ -763,17 +788,18 @@ void removeRingBackground(RingAxes &axes, int threshold) {
     axes.valid = axes.energy_60 > threshold && axes.energy_40 > threshold;
 }
 
-StylusCoordinates calculateStylusCoordinates(const TipAxes &tip,
-                                             const RingAxes &ring,
-                                             StylusCoordinateState &state) {
+StylusCoordinates calculateStylusCoordinates(
+    const TipAxes &tip, const RingAxes &ring, StylusCoordinateState &state,
+    StylusCalibrationProfile profile) {
+    const StylusCalibration calibration = calibrationFor(profile);
     StylusCoordinates output;
     const std::size_t tip_peak_40 = peakIndex(tip.axis_40);
     const std::size_t tip_peak_60 = peakIndex(tip.axis_60);
     output.tip_x = tipCoordinate(
-        tip.axis_40, kAxis40Mapping, kTipPitch40, kTipSlope40,
+        tip.axis_40, kAxis40Mapping, kTipPitch40, calibration.tip_slope_40,
         kTipEdgeParameter, kTipEdgeParameter);
     output.tip_y = tipCoordinate(
-        tip.axis_60, kAxis60Mapping, kTipPitch60, kTipSlope60,
+        tip.axis_60, kAxis60Mapping, kTipPitch60, calibration.tip_slope_60,
         kTipEdgeParameter, kTipEdgeParameter);
     if (!ring.valid)
         return output;
@@ -810,13 +836,29 @@ StylusCoordinates calculateStylusCoordinates(const TipAxes &tip,
     state.previous_difference_x = state.current_difference_x;
     state.previous_difference_y = state.current_difference_y;
     state.initialized = true;
-    output.tip_x = calibrateTipCoordinate(output.tip_x,
-                                          output.difference_x);
-    output.tip_y = calibrateTipCoordinate(output.tip_y,
-                                          output.difference_y);
-    output.tilt_x = differenceToTilt(output.difference_y);
-    output.tilt_y = differenceToTilt(output.difference_x);
+    output.tip_x = calibrateTipCoordinate(
+        output.tip_x, output.difference_x, calibration.calibration_threshold,
+        calibration.calibration_rate);
+    output.tip_y = calibrateTipCoordinate(
+        output.tip_y, output.difference_y, calibration.calibration_threshold,
+        calibration.calibration_rate);
+    output.tilt_x =
+        differenceToTilt(output.difference_y, calibration.tilt_differences);
+    output.tilt_y =
+        differenceToTilt(output.difference_x, calibration.tilt_differences);
     return output;
+}
+
+void StylusDecoder::setCalibrationProfile(StylusCalibrationProfile profile) {
+    if (calibration_profile_ == profile)
+        return;
+    calibration_profile_ = profile;
+    // Geometry filter state is profile-specific; clear on switch.
+    coordinate_state_ = {};
+    coordinate_kalman_.reset();
+    tilt_kalman_.reset();
+    coordinate_follower_.reset();
+    tilt_follower_.reset();
 }
 
 void StylusDecoder::reset() {
@@ -1180,7 +1222,7 @@ StylusFrameResult StylusDecoder::process(const RawStylusFrame &raw) {
     advanceStatus(raw.special_state);
     result.active = true;
     result.prefilter_coordinates = calculateStylusCoordinates(
-        result.tip, result.ring, coordinate_state_);
+        result.tip, result.ring, coordinate_state_, calibration_profile_);
     result.coordinates = result.prefilter_coordinates;
     applyFinalFilter(result.coordinates, result.ring.valid,
                      raw.special_state, raw.frame_interval);

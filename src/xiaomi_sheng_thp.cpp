@@ -5,6 +5,7 @@
 #include "nvt_finger_filter.hpp"
 #include "nvt_stylus.hpp"
 #include "nvt_focus_pen_pressure.hpp"
+#include "pencil_posture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -252,6 +253,12 @@ struct PenButtons {
     bool button2 = false;
 };
 
+enum class FocusPenModel {
+    None,
+    Standard,
+    Pro,
+};
+
 bool updatePenButtons(PenButtons &buttons, const input_event &event) {
     if (event.type != EV_KEY || (event.value != 0 && event.value != 1))
         return false;
@@ -271,7 +278,14 @@ bool updatePenButtons(PenButtons &buttons, const input_event &event) {
 
 class UInputPen {
 public:
-    explicit UInputPen(int maximum_pressure) {
+    // Stock HyperOS exposes two stylus nodes:
+    // - NVTCapacitivePenM80p  (ordinary Focus Pen, pressure 0..8191)
+    // - NVTCapacitivePenP81c  (Focus Pen Pro, pressure 0..16383, ABS_BRAKE)
+    explicit UInputPen(FocusPenModel model) : model_(model) {
+        const bool pro = model_ == FocusPenModel::Pro;
+        const int maximum_pressure =
+            pro ? nvt::FocusPenPressureQueue::kProMaximumPressure
+                : nvt::FocusPenPressureQueue::kStandardMaximumPressure;
         fd_ = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd_ < 0)
             throw std::runtime_error(std::string("open /dev/uinput: ") +
@@ -284,14 +298,22 @@ public:
         for (unsigned axis : {ABS_X, ABS_Y, ABS_PRESSURE, ABS_DISTANCE,
                               ABS_TILT_X, ABS_TILT_Y})
             checkedIoctl(UI_SET_ABSBIT, axis);
+        if (pro)
+            checkedIoctl(UI_SET_ABSBIT, ABS_BRAKE);
         checkedIoctl(UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+
+        // Match stock phys tags so tooling can tell M80p vs P81c apart.
+        const char *phys = pro ? "input/pen_p81c" : "input/pen";
+        if (ioctl(fd_, UI_SET_PHYS, phys) < 0)
+            throw std::runtime_error("UI_SET_PHYS failed");
 
         uinput_setup setup{};
         setup.id.bustype = BUS_VIRTUAL;
         setup.id.vendor = 0x2717;
-        setup.id.product = 0x3654;
+        setup.id.product = pro ? 0x3656 : 0x3654;
         setup.id.version = 1;
-        std::strncpy(setup.name, "NVTCapacitivePenM80p",
+        std::strncpy(setup.name,
+                     pro ? "NVTCapacitivePenP81c" : "NVTCapacitivePenM80p",
                      sizeof(setup.name) - 1);
         if (ioctl(fd_, UI_DEV_SETUP, &setup) < 0)
             throw std::runtime_error("UI_DEV_SETUP failed");
@@ -301,6 +323,8 @@ public:
         setupAxis(fd_, ABS_DISTANCE, 0, 1);
         setupAxis(fd_, ABS_TILT_X, -60, 60);
         setupAxis(fd_, ABS_TILT_Y, -60, 60);
+        if (pro)
+            setupAxis(fd_, ABS_BRAKE, 0, 360);
         if (ioctl(fd_, UI_DEV_CREATE) < 0)
             throw std::runtime_error("UI_DEV_CREATE failed");
         usleep(100000);
@@ -319,7 +343,7 @@ public:
     }
 
     void report(const PenState &state) {
-        std::array<input_event, 11> events;
+        std::array<input_event, 12> events;
         size_t event_count = 0;
         auto event = [&](uint16_t type, uint16_t code, int32_t value) {
             input_event &input = events[event_count++];
@@ -344,6 +368,10 @@ public:
         }
         event(EV_ABS, ABS_TILT_X, state.active ? state.tilt_x : 0);
         event(EV_ABS, ABS_TILT_Y, state.active ? state.tilt_y : 0);
+        // Stock P81c exposes ABS_BRAKE (raw axis 10, 0..360) as a
+        // joystick-side channel; report 0 until a dedicated mapping exists.
+        if (model_ == FocusPenModel::Pro)
+            event(EV_ABS, ABS_BRAKE, 0);
         event(EV_SYN, SYN_REPORT, 0);
         writeInputEvents(fd_, events.data(), event_count);
     }
@@ -364,6 +392,7 @@ public:
 
 private:
     int fd_ = -1;
+    FocusPenModel model_ = FocusPenModel::None;
     PenButtons buttons_{};
 
     void checkedIoctl(unsigned long request, unsigned long value) {
@@ -477,12 +506,6 @@ unsigned parseHidBus(std::string_view value) {
         return 0;
     }
 }
-
-enum class FocusPenModel {
-    None,
-    Standard,
-    Pro,
-};
 
 struct FocusPenIdentity {
     std::string name;
@@ -651,6 +674,14 @@ public:
         return true;
     }
 
+    // -1 none, 0 released, 1 pressed (stock pinch motor types 1/2).
+    int takePinchHaptic() {
+        if (!pinch_haptic_pending_)
+            return -1;
+        pinch_haptic_pending_ = false;
+        return pinch_haptic_pressed_ ? 1 : 0;
+    }
+
     std::string_view deviceAddress() const {
         return device_address_;
     }
@@ -675,6 +706,11 @@ public:
         }
         double_press_haptics_ = 0;
         slide_haptics_ = 0;
+        if (pinch_pressed_) {
+            pinch_pressed_ = false;
+            pinch_haptic_pressed_ = false;
+            pinch_haptic_pending_ = true;
+        }
         button_resync_pending_ = false;
     }
 
@@ -695,6 +731,9 @@ private:
     std::deque<ProGestureEvent> gesture_updates_;
     unsigned double_press_haptics_ = 0;
     unsigned slide_haptics_ = 0;
+    bool pinch_pressed_ = false;
+    bool pinch_haptic_pressed_ = false;
+    bool pinch_haptic_pending_ = false;
     std::chrono::steady_clock::time_point next_scan_{};
 
     void openHidraw() {
@@ -876,6 +915,12 @@ private:
             button_update_pending_ = true;
             if (allow_haptics && pressed && event.code == KEY_KPENTER)
                 ++double_press_haptics_;
+            // Stock sends pinch motor types 1/2 on F19 press/release.
+            if (allow_haptics && event.code == KEY_F19) {
+                pinch_pressed_ = pressed;
+                pinch_haptic_pressed_ = pressed;
+                pinch_haptic_pending_ = true;
+            }
             return;
         }
 
@@ -1180,6 +1225,8 @@ int main() try {
         FocusPenHidReader pen_transport;
         const std::unique_ptr<FocusPenHaptics> pen_haptics =
             makeFocusPenHaptics();
+        posture::PencilPostureFilter pencil_posture;
+        bool posture_enabled = false;
         bool touch_active = false;
         bool pen_active = false;
         bool have_valid_frame = false;
@@ -1201,14 +1248,29 @@ int main() try {
                     pen_haptics->reset();
                 gestures.reset();
                 pen.reset();
+                const auto calibration =
+                    *model_change == FocusPenModel::Pro
+                        ? nvt::StylusCalibrationProfile::Pro
+                        : nvt::StylusCalibrationProfile::Standard;
+                pen_decoder.setCalibrationProfile(calibration);
+                posture_enabled = *model_change == FocusPenModel::Pro;
+                pencil_posture.reset();
                 if (*model_change != FocusPenModel::None) {
                     const int maximum_pressure =
                         *model_change == FocusPenModel::Pro
                             ? nvt::FocusPenPressureQueue::kProMaximumPressure
                             : nvt::FocusPenPressureQueue::kStandardMaximumPressure;
-                    pen.emplace(maximum_pressure);
-                    std::cerr << "Focus Pen output ready (pressure 0.."
-                              << maximum_pressure << ")\n";
+                    pen.emplace(*model_change);
+                    std::cerr << "Focus Pen output ready ("
+                              << (*model_change == FocusPenModel::Pro
+                                      ? "NVTCapacitivePenP81c"
+                                      : "NVTCapacitivePenM80p")
+                              << ", pressure 0.." << maximum_pressure
+                              << ", stylus calibration "
+                              << (*model_change == FocusPenModel::Pro
+                                      ? "stylus_2"
+                                      : "default")
+                              << ")\n";
                 }
                 if (*model_change == FocusPenModel::Pro) {
                     try {
@@ -1218,6 +1280,17 @@ int main() try {
                         std::cerr << "Focus Pen Pro slide output disabled: "
                                   << error.what() << '\n';
                     }
+                    // Stock fe11 setup path (Messenger 3001/3002/3004/3005 family).
+                    if (pen_haptics) {
+                        pen_haptics->setDoubleTapEnabled(true);
+                        pen_haptics->setPinchMotorLevel(3);
+                        // pen_type 2 ≈ Pro/P81c family; level 0 until tip contact.
+                        pen_haptics->setWritingFeedback(2, 0);
+                        pen_haptics->setBees(false);
+                    }
+                } else if (*model_change == FocusPenModel::Standard &&
+                           pen_haptics) {
+                    pen_haptics->setWritingFeedback(1, 0);
                 }
             }
             if (const auto buttons = pen_transport.takeButtons();
@@ -1241,6 +1314,13 @@ int main() try {
             while (pen_transport.takeSlideHaptic()) {
                 if (pen_haptics)
                     pen_haptics->triggerSlide();
+            }
+            while (true) {
+                const int pinch = pen_transport.takePinchHaptic();
+                if (pinch < 0)
+                    break;
+                if (pen_haptics)
+                    pen_haptics->triggerPinch(pinch != 0);
             }
         };
         auto servicePenTransport = [&]() {
@@ -1266,6 +1346,7 @@ int main() try {
             releasePenInputs();
             adapter.reset();
             pen_decoder.reset();
+            pencil_posture.reset();
             stylus_mutual = {};
             touch_active = false;
             have_valid_frame = false;
@@ -1333,9 +1414,26 @@ int main() try {
                                 result.coordinates.tip_x, 0, kPenMaxY);
                             state.tilt_x = result.coordinates.tilt_x;
                             state.tilt_y = -result.coordinates.tilt_y;
+                            // Stock Pencil_Posture.xml chain for P81c tilt.
+                            if (posture_enabled)
+                                pencil_posture.filterTilt(state.tilt_x,
+                                                          state.tilt_y);
+                        } else if (posture_enabled) {
+                            pencil_posture.reset();
                         }
                         if (pen && (result.active || pen_active))
                             pen->report(state);
+                        // Stock writing-feedback motor: enable on tip contact.
+                        if (pen_haptics && pen) {
+                            static bool writing_active = false;
+                            const bool contact = state.active && state.contact;
+                            if (contact != writing_active) {
+                                writing_active = contact;
+                                // pen_type 2 ≈ Pro; level 3 mid stock range when down.
+                                pen_haptics->setWritingFeedback(
+                                    2, contact ? 3 : 0);
+                            }
+                        }
                         pen_active = result.active;
                         stylus_mutual.ingest(raw_stylus);
                         if (stylus_mutual.hasMatrix()) {
@@ -1352,6 +1450,8 @@ int main() try {
                         if (pen)
                             pen->report({});
                         pen_active = false;
+                        if (posture_enabled)
+                            pencil_posture.reset();
                     }
                     const uint8_t frame_type =
                         frame[kTransportLength + 24];

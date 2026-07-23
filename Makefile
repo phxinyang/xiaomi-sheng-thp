@@ -26,7 +26,8 @@ HEADERS := \
 	src/nvt_touch_core.hpp \
 	src/nvt_finger_filter.hpp \
 	src/nvt_stylus.hpp \
-	src/nvt_focus_pen_pressure.hpp
+	src/nvt_focus_pen_pressure.hpp \
+	src/pencil_posture.hpp
 
 PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec/xiaomi-sheng-thp

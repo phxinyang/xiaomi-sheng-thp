@@ -7,8 +7,12 @@ through uinput.
 
 Finger input, multi-touch tracking, palm rejection, pen coordinates, tilt,
 hover, and Bluetooth HID pressure are supported for both the Xiaomi Focus Pen
-and Focus Pen Pro. Please note that pen scanning
-is only available when the panel is running at 60 Hz or 120 Hz.
+and Focus Pen Pro. Ordinary pens are exposed as `NVTCapacitivePenM80p`
+(pressure `0..8191`); Focus Pen Pro is exposed as `NVTCapacitivePenP81c`
+(pressure `0..16383`, with stock-compatible `ABS_BRAKE`). Focus Pen Pro also
+maps pinch/double-press to stylus buttons and slides to
+`Xiaomi Focus Pen Gestures` (`KEY_PROG3` / `KEY_PROG4`). Please note that pen
+scanning is only available when the panel is running at 60 Hz or 120 Hz.
 
 ## Requirements
 

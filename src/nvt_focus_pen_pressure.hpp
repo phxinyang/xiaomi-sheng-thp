@@ -15,7 +15,8 @@ class FocusPenPressureQueue {
 public:
     static constexpr uint8_t kReportId = 5;
     static constexpr int kStandardMaximumPressure = 8191;
-    static constexpr int kProMaximumPressure = 16384;
+    // Stock NVTCapacitivePenP81c reports ABS_PRESSURE 0..16383.
+    static constexpr int kProMaximumPressure = 16383;
     static constexpr size_t kMaximumQueued = 10;
 
     static std::optional<int> decodeReport(std::span<const uint8_t> report) {

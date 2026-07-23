@@ -22,26 +22,27 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
+// Stock MiuiBleOobHelperService fe11 command prefixes (decimal in source):
+//   vibration  {94,2}  -> 5e 02 type amp
+//   writing    {89,2}  -> 59 02 pen_type level
+//   pinch fb   {90,1}  -> 5a 01 level
+//   double-tap {95,1}  -> 5f 01 on/off
+//   bees       {96,1}  -> 60 01 on/off
 constexpr std::string_view kCommandUuid =
     "0000fe11-aa6c-462a-964a-7f2ed5b3e512";
-constexpr std::array<std::uint8_t, 4> kDoublePressHaptic{
-    0x5e, 0x02, 0x03, 0x80};
-constexpr std::array<std::uint8_t, 4> kSlideHaptic{
-    0x5e, 0x02, 0x04, 0x80};
-constexpr auto kDoublePressDelay = std::chrono::milliseconds(150);
-
-enum class HapticKind {
-    DoublePress,
-    Slide,
-};
+constexpr auto kRetryDelay = std::chrono::milliseconds(100);
+constexpr std::size_t kMaximumQueued = 48;
 
 struct HapticRequest {
-    HapticKind kind;
-    std::chrono::steady_clock::time_point due;
+    std::vector<std::uint8_t> payload;
+    std::string label;
+    std::chrono::steady_clock::time_point due{};
     std::string address;
+    int attempts = 0;
 };
 
 class BluezGattWriter {
@@ -220,6 +221,7 @@ public:
                 return;
             device_address_ = address;
             requests_.clear();
+            writing_level_ = 0xff;
             condition_.notify_all();
         } catch (const std::exception &error) {
             std::cerr << "Focus Pen Pro haptic address update failed: "
@@ -227,18 +229,83 @@ public:
         }
     }
 
+    void sendRaw(std::vector<std::uint8_t> payload) noexcept override {
+        enqueue(std::move(payload), "raw", std::chrono::milliseconds(0));
+    }
+
+    void vibrate(std::uint8_t type, std::uint8_t amplitude) noexcept override {
+        enqueue({0x5e, 0x02, type, amplitude}, "vibrate",
+                std::chrono::milliseconds(0));
+    }
+
     void scheduleDoublePress() noexcept override {
-        enqueue(HapticKind::DoublePress, kDoublePressDelay);
+        vibrate(kVibrateTypeDoublePress, kDefaultAmplitude);
     }
 
     void triggerSlide() noexcept override {
-        enqueue(HapticKind::Slide, std::chrono::milliseconds(0));
+        vibrate(kVibrateTypeSlide, kDefaultAmplitude);
+    }
+
+    void triggerPinch(bool pressed) noexcept override {
+        if (pressed)
+            vibrate(kVibrateTypePinchDown, kDefaultAmplitude);
+        else
+            stopVibrate();
+    }
+
+    void stopVibrate() noexcept override {
+        // Stock stop: {94,2,0,0}
+        vibrate(kVibrateTypeStop, 0);
+    }
+
+    void setBees(bool enabled) noexcept override {
+        // Stock: {96,1,0}/{96,1,1}
+        enqueue({0x60, 0x01, static_cast<std::uint8_t>(enabled ? 1 : 0)},
+                enabled ? "bees-on" : "bees-off",
+                std::chrono::milliseconds(0));
+    }
+
+    void setDoubleTapEnabled(bool enabled) noexcept override {
+        // Stock: {95,1,0}/{95,1,1}
+        enqueue({0x5f, 0x01, static_cast<std::uint8_t>(enabled ? 1 : 0)},
+                enabled ? "double-tap-on" : "double-tap-off",
+                std::chrono::milliseconds(0));
+    }
+
+    void setWritingFeedback(std::uint8_t pen_type,
+                            std::uint8_t level) noexcept override {
+        // Stock: {89,2, pen_type, level}
+        pen_type = std::min<std::uint8_t>(pen_type, 4);
+        level = std::min<std::uint8_t>(level, 5);
+        try {
+            std::lock_guard lock(mutex_);
+            if (writing_level_ == level && writing_pen_type_ == pen_type)
+                return;
+            writing_level_ = level;
+            writing_pen_type_ = pen_type;
+        } catch (...) {
+        }
+        enqueue({0x59, 0x02, pen_type, level}, "writing-feedback",
+                std::chrono::milliseconds(0));
+    }
+
+    void setPinchMotorLevel(std::uint8_t level) noexcept override {
+        // Stock: {90,1, level}
+        level = std::min<std::uint8_t>(level, 5);
+        enqueue({0x5a, 0x01, level}, "pinch-motor-level",
+                std::chrono::milliseconds(0));
     }
 
     void reset() noexcept override {
         try {
             std::lock_guard lock(mutex_);
             requests_.clear();
+            writing_level_ = 0xff;
+            if (!device_address_.empty()) {
+                requests_.push_back(HapticRequest{
+                    {0x5e, 0x02, 0x00, 0x00}, "vibrate-stop",
+                    std::chrono::steady_clock::now(), device_address_, 0});
+            }
             condition_.notify_all();
         } catch (const std::exception &error) {
             std::cerr << "Focus Pen Pro haptic reset failed: "
@@ -251,15 +318,21 @@ private:
     std::condition_variable condition_;
     std::deque<HapticRequest> requests_;
     std::string device_address_;
+    std::uint8_t writing_level_ = 0xff;
+    std::uint8_t writing_pen_type_ = 0xff;
     BluezGattWriter writer_;
     std::jthread worker_;
 
-    void enqueue(HapticKind kind, std::chrono::milliseconds delay) noexcept {
+    void enqueue(std::vector<std::uint8_t> payload, const char *label,
+                 std::chrono::milliseconds delay) noexcept {
         try {
             std::lock_guard lock(mutex_);
+            if (requests_.size() >= kMaximumQueued)
+                requests_.pop_front();
             requests_.push_back(HapticRequest{
-                kind, std::chrono::steady_clock::now() + delay,
-                device_address_});
+                std::move(payload), label,
+                std::chrono::steady_clock::now() + delay, device_address_,
+                0});
             condition_.notify_all();
         } catch (const std::exception &error) {
             std::cerr << "Focus Pen Pro haptic request dropped: "
@@ -289,32 +362,46 @@ private:
             HapticRequest request = std::move(*next);
             requests_.erase(next);
             lock.unlock();
+            bool ok = false;
             try {
-                send(request);
+                ok = send(request);
             } catch (const std::exception &error) {
                 std::cerr << "Focus Pen Pro haptic worker failed: "
                           << error.what() << '\n';
             }
             lock.lock();
+            if (!ok && request.attempts == 0 && !request.address.empty()) {
+                request.attempts = 1;
+                request.due = std::chrono::steady_clock::now() + kRetryDelay;
+                if (requests_.size() >= kMaximumQueued)
+                    requests_.pop_front();
+                requests_.push_back(std::move(request));
+            }
         }
     }
 
-    void send(const HapticRequest &request) {
-        const char *name = request.kind == HapticKind::DoublePress
-                               ? "double-press"
-                               : "slide";
+    bool send(const HapticRequest &request) {
         if (request.address.empty()) {
-            std::cerr << "Focus Pen Pro " << name
-                      << " haptic skipped: device address unavailable\n";
-            return;
+            std::cerr << "Focus Pen Pro " << request.label
+                      << " skipped: device address unavailable\n";
+            return false;
         }
+        if (request.payload.empty())
+            return false;
         writer_.setDeviceAddress(request.address);
-        const std::span<const std::uint8_t> command =
-            request.kind == HapticKind::DoublePress
-                ? std::span<const std::uint8_t>(kDoublePressHaptic)
-                : std::span<const std::uint8_t>(kSlideHaptic);
-        std::cerr << "Focus Pen Pro " << name << " haptic "
-                  << (writer_.trigger(command) ? "sent" : "failed") << '\n';
+        const bool ok = writer_.trigger(request.payload);
+        std::cerr << "Focus Pen Pro " << request.label << " "
+                  << (ok ? "sent" : "failed") << " [";
+        for (std::size_t i = 0; i < request.payload.size(); ++i) {
+            if (i)
+                std::cerr << ' ';
+            const unsigned value = request.payload[i];
+            if (value < 0x10)
+                std::cerr << '0';
+            std::cerr << std::hex << value << std::dec;
+        }
+        std::cerr << ']' << (request.attempts ? " retry" : "") << '\n';
+        return ok;
     }
 };
 
