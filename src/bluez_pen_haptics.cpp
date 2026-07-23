@@ -26,16 +26,34 @@
 
 namespace {
 
-// Stock MiuiBleOobHelperService fe11 command prefixes (decimal in source):
-//   vibration  {94,2}  -> 5e 02 type amp
-//   writing    {89,2}  -> 59 02 pen_type level
-//   pinch fb   {90,1}  -> 5a 01 level
-//   double-tap {95,1}  -> 5f 01 on/off
-//   bees       {96,1}  -> 60 01 on/off
+// Stock MiuiBleOobHelperService fe11 prefixes (STOCK-FOCUS-PEN-BLE.md):
+//   vibration  {94,2} -> 5e 02 type amp
+//   writing    {89,2} -> 59 02 pen_type level
+//   pinch fb   {90,1} -> 5a 01 level
+//   pinch thr  {92,4} -> 5c 04 thr_be rel_be
+//   double-tap {95,1} -> 5f 01 on/off
+//   bees       {96,1} -> 60 01 on/off
+//   screen     {97,1} -> 61 01 on/off
+//   up/move    {98,1} -> 62 01 on/off
+//   A+G        {91,1} -> 5b 01 on/off
 constexpr std::string_view kCommandUuid =
     "0000fe11-aa6c-462a-964a-7f2ed5b3e512";
 constexpr auto kRetryDelay = std::chrono::milliseconds(100);
 constexpr std::size_t kMaximumQueued = 48;
+
+struct PinchThreshold {
+    std::uint16_t trigger;
+    std::uint16_t release;
+};
+
+// Official sheng.xml table (STOCK §3.3).
+constexpr std::array<PinchThreshold, 5> kPinchThresholdTable{{
+    {90, 45},    // extreme_weak
+    {180, 90},   // weak
+    {270, 135},  // medium
+    {360, 180},  // strong
+    {450, 225},  // extreme_strong
+}};
 
 struct HapticRequest {
     std::vector<std::uint8_t> payload;
@@ -221,7 +239,6 @@ public:
                 return;
             device_address_ = address;
             requests_.clear();
-            writing_level_ = 0xff;
             condition_.notify_all();
         } catch (const std::exception &error) {
             std::cerr << "Focus Pen Pro haptic address update failed: "
@@ -230,12 +247,11 @@ public:
     }
 
     void sendRaw(std::vector<std::uint8_t> payload) noexcept override {
-        enqueue(std::move(payload), "raw", std::chrono::milliseconds(0));
+        enqueue(std::move(payload), "raw");
     }
 
     void vibrate(std::uint8_t type, std::uint8_t amplitude) noexcept override {
-        enqueue({0x5e, 0x02, type, amplitude}, "vibrate",
-                std::chrono::milliseconds(0));
+        enqueue({0x5e, 0x02, type, amplitude}, "vibrate");
     }
 
     void scheduleDoublePress() noexcept override {
@@ -246,61 +262,70 @@ public:
         vibrate(kVibrateTypeSlide, kDefaultAmplitude);
     }
 
-    void triggerPinch(bool pressed) noexcept override {
-        if (pressed)
-            vibrate(kVibrateTypePinchDown, kDefaultAmplitude);
-        else
-            stopVibrate();
-    }
-
     void stopVibrate() noexcept override {
-        // Stock stop: {94,2,0,0}
         vibrate(kVibrateTypeStop, 0);
     }
 
-    void setBees(bool enabled) noexcept override {
-        // Stock: {96,1,0}/{96,1,1}
-        enqueue({0x60, 0x01, static_cast<std::uint8_t>(enabled ? 1 : 0)},
-                enabled ? "bees-on" : "bees-off",
-                std::chrono::milliseconds(0));
+    void setDoubleTapEnabled(bool enabled) noexcept override {
+        enqueue({0x5f, 0x01, static_cast<std::uint8_t>(enabled ? 1 : 0)},
+                enabled ? "double-tap-on" : "double-tap-off");
     }
 
-    void setDoubleTapEnabled(bool enabled) noexcept override {
-        // Stock: {95,1,0}/{95,1,1}
-        enqueue({0x5f, 0x01, static_cast<std::uint8_t>(enabled ? 1 : 0)},
-                enabled ? "double-tap-on" : "double-tap-off",
-                std::chrono::milliseconds(0));
+    void setPinchMotorLevel(std::uint8_t level) noexcept override {
+        level = std::min<std::uint8_t>(level, 5);
+        enqueue({0x5a, 0x01, level}, "pinch-motor-level");
+    }
+
+    void setPinchThreshold(std::uint16_t trigger,
+                           std::uint16_t release) noexcept override {
+        // STOCK §3.3: 5c 04 | trigger_u16_be | release_u16_be
+        enqueue({0x5c, 0x04,
+                 static_cast<std::uint8_t>((trigger >> 8) & 0xff),
+                 static_cast<std::uint8_t>(trigger & 0xff),
+                 static_cast<std::uint8_t>((release >> 8) & 0xff),
+                 static_cast<std::uint8_t>(release & 0xff)},
+                "pinch-threshold");
+    }
+
+    void setPinchThresholdLevel(PinchThresholdLevel level) noexcept override {
+        const auto index = static_cast<std::size_t>(level);
+        const auto &entry =
+            kPinchThresholdTable[std::min(index, kPinchThresholdTable.size() - 1)];
+        setPinchThreshold(entry.trigger, entry.release);
+    }
+
+    void setScreenState(bool on) noexcept override {
+        enqueue({0x61, 0x01, static_cast<std::uint8_t>(on ? 1 : 0)},
+                on ? "screen-on" : "screen-off");
+    }
+
+    void setBees(bool enabled) noexcept override {
+        enqueue({0x60, 0x01, static_cast<std::uint8_t>(enabled ? 1 : 0)},
+                enabled ? "bees-on" : "bees-off");
     }
 
     void setWritingFeedback(std::uint8_t pen_type,
                             std::uint8_t level) noexcept override {
-        // Stock: {89,2, pen_type, level}
+        // STOCK §7 P2: off by default; API kept for future settings path.
         pen_type = std::min<std::uint8_t>(pen_type, 4);
         level = std::min<std::uint8_t>(level, 5);
-        try {
-            std::lock_guard lock(mutex_);
-            if (writing_level_ == level && writing_pen_type_ == pen_type)
-                return;
-            writing_level_ = level;
-            writing_pen_type_ = pen_type;
-        } catch (...) {
-        }
-        enqueue({0x59, 0x02, pen_type, level}, "writing-feedback",
-                std::chrono::milliseconds(0));
+        enqueue({0x59, 0x02, pen_type, level}, "writing-feedback");
     }
 
-    void setPinchMotorLevel(std::uint8_t level) noexcept override {
-        // Stock: {90,1, level}
-        level = std::min<std::uint8_t>(level, 5);
-        enqueue({0x5a, 0x01, level}, "pinch-motor-level",
-                std::chrono::milliseconds(0));
+    void setAccelGyroState(bool active) noexcept override {
+        enqueue({0x5b, 0x01, static_cast<std::uint8_t>(active ? 1 : 0)},
+                active ? "a-g-on" : "a-g-off");
+    }
+
+    void setStylusUpMove(bool active) noexcept override {
+        enqueue({0x62, 0x01, static_cast<std::uint8_t>(active ? 1 : 0)},
+                active ? "up-move-on" : "up-move-off");
     }
 
     void reset() noexcept override {
         try {
             std::lock_guard lock(mutex_);
             requests_.clear();
-            writing_level_ = 0xff;
             if (!device_address_.empty()) {
                 requests_.push_back(HapticRequest{
                     {0x5e, 0x02, 0x00, 0x00}, "vibrate-stop",
@@ -318,21 +343,17 @@ private:
     std::condition_variable condition_;
     std::deque<HapticRequest> requests_;
     std::string device_address_;
-    std::uint8_t writing_level_ = 0xff;
-    std::uint8_t writing_pen_type_ = 0xff;
     BluezGattWriter writer_;
     std::jthread worker_;
 
-    void enqueue(std::vector<std::uint8_t> payload, const char *label,
-                 std::chrono::milliseconds delay) noexcept {
+    void enqueue(std::vector<std::uint8_t> payload, const char *label) noexcept {
         try {
             std::lock_guard lock(mutex_);
             if (requests_.size() >= kMaximumQueued)
                 requests_.pop_front();
             requests_.push_back(HapticRequest{
-                std::move(payload), label,
-                std::chrono::steady_clock::now() + delay, device_address_,
-                0});
+                std::move(payload), label, std::chrono::steady_clock::now(),
+                device_address_, 0});
             condition_.notify_all();
         } catch (const std::exception &error) {
             std::cerr << "Focus Pen Pro haptic request dropped: "
@@ -370,6 +391,7 @@ private:
                           << error.what() << '\n';
             }
             lock.lock();
+            // Stock retries a failed write once after ~100ms.
             if (!ok && request.attempts == 0 && !request.address.empty()) {
                 request.attempts = 1;
                 request.due = std::chrono::steady_clock::now() + kRetryDelay;

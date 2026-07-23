@@ -1216,7 +1216,6 @@ int main() try {
         bool posture_enabled = false;
         bool touch_active = false;
         bool pen_active = false;
-        int writing_feedback_level = -1;
         bool have_valid_frame = false;
         bool stream_stalled = false;
         auto last_valid_frame = std::chrono::steady_clock::now();
@@ -1240,15 +1239,6 @@ int main() try {
                     pen_p81c->report({});
             }
         };
-        auto writingFeedbackLevelFor = [](int pressure, int maximum) {
-            if (pressure <= 0 || maximum <= 0)
-                return 0;
-            // Stock writing feedback uses levels 0..5; map contact pressure
-            // into 1..5 without exposing a user setting here.
-            const int level =
-                1 + (std::min(pressure, maximum) * 4) / maximum;
-            return std::clamp(level, 1, 5);
-        };
         auto applyPenTransportOutputs = [&]() {
             const auto model_change = pen_transport.takeModelChange();
             if (model_change) {
@@ -1263,7 +1253,6 @@ int main() try {
                 if (gestures)
                     gestures->release();
                 pen_active = false;
-                writing_feedback_level = -1;
                 pen_pressure.reset();
                 if (pen_haptics)
                     pen_haptics->reset();
@@ -1302,16 +1291,16 @@ int main() try {
                         std::cerr << "Focus Pen Pro slide output disabled: "
                                   << error.what() << '\n';
                     }
-                    // Stock fe11 setup (except user-facing intensity/switches).
+                    // STOCK-FOCUS-PEN-BLE.md §3.4 / §7 P0 Pro init:
+                    //   5f 01 01 | 5a 01 03 | 5c 04 <thr> | 61 01 01
+                    // No default 59 02 / 60 01 (writing/bees remain off).
                     if (pen_haptics) {
                         pen_haptics->setDoubleTapEnabled(true);
                         pen_haptics->setPinchMotorLevel(3);
-                        pen_haptics->setWritingFeedback(2, 0);
-                        pen_haptics->setBees(false);
+                        pen_haptics->setPinchThresholdLevel(
+                            FocusPenHaptics::PinchThresholdLevel::Medium);
+                        pen_haptics->setScreenState(true);
                     }
-                } else if (active_pen_model == FocusPenModel::Standard &&
-                           pen_haptics) {
-                    pen_haptics->setWritingFeedback(1, 0);
                 }
                 idleInactivePen();
             }
@@ -1350,7 +1339,6 @@ int main() try {
             pen_transport.releaseInputState();
             applyPenTransportOutputs();
             pen_pressure.reset();
-            writing_feedback_level = -1;
             if (pen_haptics)
                 pen_haptics->reset();
             if (pen_m80p)
@@ -1444,29 +1432,6 @@ int main() try {
                         if (pen && (result.active || pen_active))
                             pen->report(state);
                         idleInactivePen();
-                        // Writing-feedback motor level tracks tip pressure
-                        // (1..5); settings UI lives elsewhere.
-                        if (pen_haptics && pen &&
-                            active_pen_model != FocusPenModel::None) {
-                            const int maximum_pressure =
-                                active_pen_model == FocusPenModel::Pro
-                                    ? nvt::FocusPenPressureQueue::
-                                          kProMaximumPressure
-                                    : nvt::FocusPenPressureQueue::
-                                          kStandardMaximumPressure;
-                            const int pen_type =
-                                active_pen_model == FocusPenModel::Pro ? 2
-                                                                      : 1;
-                            const int level = writingFeedbackLevelFor(
-                                state.contact ? state.pressure : 0,
-                                maximum_pressure);
-                            if (level != writing_feedback_level) {
-                                writing_feedback_level = level;
-                                pen_haptics->setWritingFeedback(
-                                    static_cast<std::uint8_t>(pen_type),
-                                    static_cast<std::uint8_t>(level));
-                            }
-                        }
                         pen_active = result.active;
                         stylus_mutual.ingest(raw_stylus);
                         if (stylus_mutual.hasMatrix()) {
@@ -1485,7 +1450,6 @@ int main() try {
                         if (pen_p81c)
                             pen_p81c->report({});
                         pen_active = false;
-                        writing_feedback_level = -1;
                         if (posture_enabled)
                             pencil_posture.reset();
                     }
@@ -1506,7 +1470,6 @@ int main() try {
                             pen_p81c->report({});
                         touch_active = false;
                         pen_active = false;
-                        writing_feedback_level = -1;
                         std::cerr << "touch reference ready\n";
                         return;
                     }
