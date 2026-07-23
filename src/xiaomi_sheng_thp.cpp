@@ -674,14 +674,6 @@ public:
         return true;
     }
 
-    // -1 none, 0 released, 1 pressed (stock pinch motor types 1/2).
-    int takePinchHaptic() {
-        if (!pinch_haptic_pending_)
-            return -1;
-        pinch_haptic_pending_ = false;
-        return pinch_haptic_pressed_ ? 1 : 0;
-    }
-
     std::string_view deviceAddress() const {
         return device_address_;
     }
@@ -706,11 +698,6 @@ public:
         }
         double_press_haptics_ = 0;
         slide_haptics_ = 0;
-        if (pinch_pressed_) {
-            pinch_pressed_ = false;
-            pinch_haptic_pressed_ = false;
-            pinch_haptic_pending_ = true;
-        }
         button_resync_pending_ = false;
     }
 
@@ -731,9 +718,6 @@ private:
     std::deque<ProGestureEvent> gesture_updates_;
     unsigned double_press_haptics_ = 0;
     unsigned slide_haptics_ = 0;
-    bool pinch_pressed_ = false;
-    bool pinch_haptic_pressed_ = false;
-    bool pinch_haptic_pending_ = false;
     std::chrono::steady_clock::time_point next_scan_{};
 
     void openHidraw() {
@@ -913,14 +897,10 @@ private:
                 return;
             *button = pressed;
             button_update_pending_ = true;
+            // Pinch (F19) keeps stylus-button mapping only: the pen already
+            // self-vibrates, so skip extra GATT pinch-motor commands.
             if (allow_haptics && pressed && event.code == KEY_KPENTER)
                 ++double_press_haptics_;
-            // Stock sends pinch motor types 1/2 on F19 press/release.
-            if (allow_haptics && event.code == KEY_F19) {
-                pinch_pressed_ = pressed;
-                pinch_haptic_pressed_ = pressed;
-                pinch_haptic_pending_ = true;
-            }
             return;
         }
 
@@ -1210,13 +1190,19 @@ int main() try {
         throw std::runtime_error(std::string("open stream: ") +
                                  std::strerror(errno));
     std::optional<UInputTouch> touch;
-    std::optional<UInputPen> pen;
+    // Stock keeps both stylus nodes resident; only the active model is fed.
+    std::optional<UInputPen> pen_m80p;
+    std::optional<UInputPen> pen_p81c;
     std::optional<UInputProGestures> gestures;
     try {
         writeControl(kStylusPath, 1);
         writeControl(kControlPath, 1);
         touch.emplace();
+        pen_m80p.emplace(FocusPenModel::Standard);
+        pen_p81c.emplace(FocusPenModel::Pro);
         std::cerr << "touch pipeline ready\n";
+        std::cerr << "stylus nodes ready (NVTCapacitivePenM80p + "
+                     "NVTCapacitivePenP81c)\n";
         std::cerr << "waiting for a touch reference frame\n";
         LiveTouchAdapter adapter;
         nvt::StylusDecoder pen_decoder;
@@ -1226,53 +1212,89 @@ int main() try {
         const std::unique_ptr<FocusPenHaptics> pen_haptics =
             makeFocusPenHaptics();
         posture::PencilPostureFilter pencil_posture;
+        FocusPenModel active_pen_model = FocusPenModel::None;
         bool posture_enabled = false;
         bool touch_active = false;
         bool pen_active = false;
+        int writing_feedback_level = -1;
         bool have_valid_frame = false;
         bool stream_stalled = false;
         auto last_valid_frame = std::chrono::steady_clock::now();
         StreamReader reader(stream_fd);
+        auto activePen = [&]() -> std::optional<UInputPen> & {
+            if (active_pen_model == FocusPenModel::Pro)
+                return pen_p81c;
+            return pen_m80p;
+        };
+        auto idleInactivePen = [&]() {
+            if (active_pen_model == FocusPenModel::Pro) {
+                if (pen_m80p)
+                    pen_m80p->report({});
+            } else if (active_pen_model == FocusPenModel::Standard) {
+                if (pen_p81c)
+                    pen_p81c->report({});
+            } else {
+                if (pen_m80p)
+                    pen_m80p->report({});
+                if (pen_p81c)
+                    pen_p81c->report({});
+            }
+        };
+        auto writingFeedbackLevelFor = [](int pressure, int maximum) {
+            if (pressure <= 0 || maximum <= 0)
+                return 0;
+            // Stock writing feedback uses levels 0..5; map contact pressure
+            // into 1..5 without exposing a user setting here.
+            const int level =
+                1 + (std::min(pressure, maximum) * 4) / maximum;
+            return std::clamp(level, 1, 5);
+        };
         auto applyPenTransportOutputs = [&]() {
             const auto model_change = pen_transport.takeModelChange();
             if (model_change) {
-                if (pen) {
-                    pen->reportButtons({});
-                    pen->report({});
+                if (pen_m80p) {
+                    pen_m80p->reportButtons({});
+                    pen_m80p->report({});
+                }
+                if (pen_p81c) {
+                    pen_p81c->reportButtons({});
+                    pen_p81c->report({});
                 }
                 if (gestures)
                     gestures->release();
                 pen_active = false;
+                writing_feedback_level = -1;
                 pen_pressure.reset();
                 if (pen_haptics)
                     pen_haptics->reset();
                 gestures.reset();
-                pen.reset();
+                active_pen_model = *model_change;
                 const auto calibration =
-                    *model_change == FocusPenModel::Pro
+                    active_pen_model == FocusPenModel::Pro
                         ? nvt::StylusCalibrationProfile::Pro
                         : nvt::StylusCalibrationProfile::Standard;
                 pen_decoder.setCalibrationProfile(calibration);
-                posture_enabled = *model_change == FocusPenModel::Pro;
+                posture_enabled = active_pen_model == FocusPenModel::Pro;
                 pencil_posture.reset();
-                if (*model_change != FocusPenModel::None) {
+                if (active_pen_model != FocusPenModel::None) {
                     const int maximum_pressure =
-                        *model_change == FocusPenModel::Pro
+                        active_pen_model == FocusPenModel::Pro
                             ? nvt::FocusPenPressureQueue::kProMaximumPressure
                             : nvt::FocusPenPressureQueue::kStandardMaximumPressure;
-                    pen.emplace(*model_change);
-                    std::cerr << "Focus Pen output ready ("
-                              << (*model_change == FocusPenModel::Pro
+                    std::cerr << "Focus Pen output active ("
+                              << (active_pen_model == FocusPenModel::Pro
                                       ? "NVTCapacitivePenP81c"
                                       : "NVTCapacitivePenM80p")
                               << ", pressure 0.." << maximum_pressure
                               << ", stylus calibration "
-                              << (*model_change == FocusPenModel::Pro
+                              << (active_pen_model == FocusPenModel::Pro
                                       ? "stylus_2"
                                       : "default")
                               << ")\n";
+                } else {
+                    std::cerr << "Focus Pen output idle (both nodes resident)\n";
                 }
-                if (*model_change == FocusPenModel::Pro) {
+                if (active_pen_model == FocusPenModel::Pro) {
                     try {
                         gestures.emplace();
                         std::cerr << "Focus Pen Pro slide output ready\n";
@@ -1280,19 +1302,20 @@ int main() try {
                         std::cerr << "Focus Pen Pro slide output disabled: "
                                   << error.what() << '\n';
                     }
-                    // Stock fe11 setup path (Messenger 3001/3002/3004/3005 family).
+                    // Stock fe11 setup (except user-facing intensity/switches).
                     if (pen_haptics) {
                         pen_haptics->setDoubleTapEnabled(true);
                         pen_haptics->setPinchMotorLevel(3);
-                        // pen_type 2 ≈ Pro/P81c family; level 0 until tip contact.
                         pen_haptics->setWritingFeedback(2, 0);
                         pen_haptics->setBees(false);
                     }
-                } else if (*model_change == FocusPenModel::Standard &&
+                } else if (active_pen_model == FocusPenModel::Standard &&
                            pen_haptics) {
                     pen_haptics->setWritingFeedback(1, 0);
                 }
+                idleInactivePen();
             }
+            auto &pen = activePen();
             if (const auto buttons = pen_transport.takeButtons();
                 buttons && pen)
                 pen->reportButtons(*buttons);
@@ -1315,13 +1338,6 @@ int main() try {
                 if (pen_haptics)
                     pen_haptics->triggerSlide();
             }
-            while (true) {
-                const int pinch = pen_transport.takePinchHaptic();
-                if (pinch < 0)
-                    break;
-                if (pen_haptics)
-                    pen_haptics->triggerPinch(pinch != 0);
-            }
         };
         auto servicePenTransport = [&]() {
             pen_transport.service(pen_pressure);
@@ -1334,10 +1350,13 @@ int main() try {
             pen_transport.releaseInputState();
             applyPenTransportOutputs();
             pen_pressure.reset();
+            writing_feedback_level = -1;
             if (pen_haptics)
                 pen_haptics->reset();
-            if (pen)
-                pen->report({});
+            if (pen_m80p)
+                pen_m80p->report({});
+            if (pen_p81c)
+                pen_p81c->report({});
             pen_active = false;
         };
         auto resetPipelines = [&]() {
@@ -1421,17 +1440,31 @@ int main() try {
                         } else if (posture_enabled) {
                             pencil_posture.reset();
                         }
+                        auto &pen = activePen();
                         if (pen && (result.active || pen_active))
                             pen->report(state);
-                        // Stock writing-feedback motor: enable on tip contact.
-                        if (pen_haptics && pen) {
-                            static bool writing_active = false;
-                            const bool contact = state.active && state.contact;
-                            if (contact != writing_active) {
-                                writing_active = contact;
-                                // pen_type 2 ≈ Pro; level 3 mid stock range when down.
+                        idleInactivePen();
+                        // Writing-feedback motor level tracks tip pressure
+                        // (1..5); settings UI lives elsewhere.
+                        if (pen_haptics && pen &&
+                            active_pen_model != FocusPenModel::None) {
+                            const int maximum_pressure =
+                                active_pen_model == FocusPenModel::Pro
+                                    ? nvt::FocusPenPressureQueue::
+                                          kProMaximumPressure
+                                    : nvt::FocusPenPressureQueue::
+                                          kStandardMaximumPressure;
+                            const int pen_type =
+                                active_pen_model == FocusPenModel::Pro ? 2
+                                                                      : 1;
+                            const int level = writingFeedbackLevelFor(
+                                state.contact ? state.pressure : 0,
+                                maximum_pressure);
+                            if (level != writing_feedback_level) {
+                                writing_feedback_level = level;
                                 pen_haptics->setWritingFeedback(
-                                    2, contact ? 3 : 0);
+                                    static_cast<std::uint8_t>(pen_type),
+                                    static_cast<std::uint8_t>(level));
                             }
                         }
                         pen_active = result.active;
@@ -1447,9 +1480,12 @@ int main() try {
                         return;
                     }
                     if (pen_active) {
-                        if (pen)
-                            pen->report({});
+                        if (pen_m80p)
+                            pen_m80p->report({});
+                        if (pen_p81c)
+                            pen_p81c->report({});
                         pen_active = false;
+                        writing_feedback_level = -1;
                         if (posture_enabled)
                             pencil_posture.reset();
                     }
@@ -1464,10 +1500,13 @@ int main() try {
                     if (update.baseline_ready) {
                         if (touch)
                             touch->report({});
-                        if (pen)
-                            pen->report({});
+                        if (pen_m80p)
+                            pen_m80p->report({});
+                        if (pen_p81c)
+                            pen_p81c->report({});
                         touch_active = false;
                         pen_active = false;
+                        writing_feedback_level = -1;
                         std::cerr << "touch reference ready\n";
                         return;
                     }
@@ -1501,7 +1540,8 @@ int main() try {
         throw;
     }
     gestures.reset();
-    pen.reset();
+    pen_m80p.reset();
+    pen_p81c.reset();
     touch.reset();
     writeControl(kStylusPath, 0);
     writeControl(kControlPath, 0);
